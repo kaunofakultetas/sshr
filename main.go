@@ -5,6 +5,7 @@ import (
 	"github.com/Gurpartap/logrus-stack"
 	"github.com/tsurubee/sshr/sshr"
 	"errors"
+	"strings"
 )
 
 func init() {
@@ -28,11 +29,14 @@ func main() {
 }
 
 func FindUpstreamByUsername(username string) (string, error) {
-	if username == "tsurubee" {
-		return "host-tsurubee", nil
-	} else if username == "hoge" {
-		return "host-hoge", nil
-	} else {
-		return "", errors.New(username + "'s host is not found!")
+	// Check if username starts with "server"
+	if strings.HasPrefix(username, "server") {
+		serverNum := strings.TrimPrefix(username, "server")
+		if serverNum != "" {
+			return "hosting-users-dind-" + serverNum, nil
+		}
 	}
+	
+	// Fallback or error
+	return "", errors.New(username + "'s host is not found!")
 }

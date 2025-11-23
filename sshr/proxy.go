@@ -23,8 +23,9 @@ func newSSHProxyConn(conn net.Conn, proxyConf *ssh.ProxyConfig) (proxyConn *ssh.
 	}
 
 	username := authRequestMsg.User
+	// Force username to admin for upstream connection
 	p := &ssh.ProxyConn{
-		User:       username,
+		User:       "root",
 		Downstream: d,
 	}
 	upstreamHost, err := proxyConf.FindUpstreamHook(username)
@@ -54,6 +55,18 @@ func newSSHProxyConn(conn net.Conn, proxyConf *ssh.ProxyConfig) (proxyConn *ssh.
 	}()
 
 	p.Upstream = u
+
+	// Force authentication to password "root"
+	// We need to modify authRequestMsg or create a new one if possible, but AuthenticateProxyConn takes the msg.
+	// Let's see if we can modify the msg.
+	authRequestMsg.User = "root"
+	authRequestMsg.Method = "password"
+	// Payload for password auth is: boolean(FALSE) + string(password)
+	// FALSE is 1 byte (0x00)
+	// string is 4 bytes length + bytes
+	// "root" length is 4.
+	// Payload: [0, 0, 0, 0, 4, 'r', 'o', 'o', 't']
+	authRequestMsg.Payload = []byte{0, 0, 0, 0, 4, 'r', 'o', 'o', 't'}
 
 	if err = p.AuthenticateProxyConn(authRequestMsg, proxyConf); err != nil {
 		return p, err
