@@ -7,7 +7,8 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -o sshr_bin main.go
+RUN go mod tidy
+RUN go build -o sshr_bin .
 
 EXPOSE 2222
 
