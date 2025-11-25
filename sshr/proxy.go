@@ -54,11 +54,12 @@ func newSSHProxyConn(conn net.Conn, proxyConf *ssh.ProxyConfig) (proxyConn *ssh.
 		// Call FindUpstreamHook - this queries backend and populates authstore
 		upstreamHost, err := proxyConf.FindUpstreamHook(username)
 		if err != nil {
+			logrus.Errorf("FindUpstreamHook failed for %s: %v", username, err)
 			p := &ssh.ProxyConn{User: username, Downstream: d}
 			if sendErr := p.SendFailureMsg("password"); sendErr != nil {
-				return p, sendErr
+				return nil, sendErr
 			}
-			return p, err
+			continue
 		}
 		
 		// Get full auth info from authstore (populated by FindUpstreamHook in main.go)
@@ -80,18 +81,44 @@ func newSSHProxyConn(conn net.Conn, proxyConf *ssh.ProxyConfig) (proxyConn *ssh.
 			upstreamPass = "root"
 			logrus.Warnf("No backend auth found for %s, using defaults", username)
 		}
-		
-		// Create proxy connection
+
+		// Verify password LOCALLY first
+		password, err := parsePasswordPayload(authRequestMsg.Payload)
+		if err != nil {
+			logrus.Errorf("Failed to parse password payload: %v", err)
+			// If payload is bad, maybe we should close? Or just fail auth?
+			// Let's fail auth.
+			p := &ssh.ProxyConn{Downstream: d}
+			p.SendFailureMsg("password")
+			continue
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
+			logrus.Warnf("Password verification failed for user %s: %v", username, err)
+			p := &ssh.ProxyConn{Downstream: d}
+			if err := p.SendFailureMsg("password"); err != nil {
+				return nil, err
+			}
+			// CRITICAL FIX: Do not return! Continue loop to allow retry.
+			continue
+		}
+
+		logrus.Infof("Password verified for user %s. Connecting to upstream...", username)
+
+		// Create proxy connection structure
 		p := &ssh.ProxyConn{
 			User:            upstreamUser,
 			Downstream:      d,
 			DestinationHost: upstreamHost,
 		}
 
-		// Connect to upstream server
+		// Connect to upstream server ONLY after successful auth
 		upConn, err := net.Dial("tcp", upstreamHost+":"+upstreamPort)
 		if err != nil {
 			logrus.Errorf("Failed to connect to upstream %s:%s: %v", upstreamHost, upstreamPort, err)
+			// If we can't connect to upstream, we can't really proceed. 
+			// We could try to fail auth, but the user provided correct password.
+			// Returning error closes connection, which is probably appropriate here as it's a system error.
 			return p, err
 		}
 
@@ -103,52 +130,20 @@ func newSSHProxyConn(conn net.Conn, proxyConf *ssh.ProxyConfig) (proxyConn *ssh.
 			return p, err
 		}
 		
-		// We cannot defer u.Close() here easily because we are inside loop and returning.
-		// But we can check if we return error.
-		// The outer defer handles d.Close().
-		// We need to handle u.Close() if we fail before returning p.
-		
 		p.Upstream = u
 
-		// Verify password if method is password
-		if authRequestMsg.Method == "password" {
-			password, err := parsePasswordPayload(authRequestMsg.Payload)
-			if err != nil {
-				logrus.Errorf("Failed to parse password payload: %v", err)
-				u.Close()
-				return p, err
-			}
-
-			if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
-				logrus.Errorf("Password verification failed for user %s: %v", username, err)
-				p.SendFailureMsg("password")
-				u.Close()
-				return p, err
-			}
-
-			logrus.Infof("Password verified for user %s. Authenticating to upstream as %s using provided upstream password", username, upstreamUser)
-			
-			// Use upstream password provided by backend
-			authRequestMsg.Payload = createPasswordPayload(upstreamPass)
-			authRequestMsg.User = upstreamUser
-			
-			if err := p.AuthenticateProxyConn(authRequestMsg, proxyConf); err != nil {
-				logrus.Errorf("Upstream authentication failed: %v", err)
-				u.Close()
-				return p, err
-			}
-
-			logrus.Infof("Successfully authenticated %s to upstream", username)
-			return p, nil
-		}
-
-		// Fallback for other methods (should not reach here due to loop checks, but safe to keep)
+		logrus.Infof("Authenticating to upstream as %s using provided upstream password", upstreamUser)
+		
+		// Use upstream password provided by backend
+		authRequestMsg.Payload = createPasswordPayload(upstreamPass)
 		authRequestMsg.User = upstreamUser
 		
-		logrus.Infof("Authenticating to upstream as user: %s", upstreamUser)
-		if err = p.AuthenticateProxyConn(authRequestMsg, proxyConf); err != nil {
+		if err := p.AuthenticateProxyConn(authRequestMsg, proxyConf); err != nil {
 			logrus.Errorf("Upstream authentication failed: %v", err)
 			u.Close()
+			// If upstream auth fails (even though we verified local password), we have to fail.
+			// Since we already connected, we might need to close upstream and return error or fail auth.
+			// If we return error, client gets disconnected.
 			return p, err
 		}
 
